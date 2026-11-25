@@ -1,0 +1,414 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+#
+# Init script for the etherip6 QEMU test VM.  It is intentionally written
+# for busybox ash and prints markers that run-vm-test.sh looks for.
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+
+fail() {
+	echo "INIT FAIL: $*"
+	echo "--- dmesg ---"
+	dmesg | tail -80
+	echo "INIT FAIL: $*"
+	poweroff -f
+	sleep 5
+	exit 1
+}
+
+echo "=== etherip6 VM selftest ==="
+uname -a
+
+/sbin/ip -V || fail "iproute2 binary does not run"
+
+insmod /etherip6.ko || fail "insmod etherip6.ko"
+sleep 1
+grep -q etherip6 /proc/modules || fail "etherip6 module not loaded"
+echo "MODULE LOADED"
+
+/sbin/ip link set lo up || fail "lo up"
+/sbin/ip -6 addr add 2001:db8::1/128 dev lo || fail "addr add ::1"
+/sbin/ip -6 addr add 2001:db8::2/128 dev lo || fail "addr add ::2"
+/sbin/ip link set lo mtu 1280 || fail "lo mtu 1280"
+
+echo "--- rtnetlink configuration ---"
+/etherip6ctl create eip0 local 2001:db8::1 remote 2001:db8::2 mtu 9000 ||
+	fail "create eip0"
+/etherip6ctl create eip1 local 2001:db8::2 remote 2001:db8::1 mtu 9000 ||
+	fail "create eip1"
+# Keep the tunnel ports quiet: no IPv6 addresses / ND on the L2 ports.
+echo 1 > /proc/sys/net/ipv6/conf/eip0/disable_ipv6 || fail "disable_ipv6 eip0"
+echo 1 > /proc/sys/net/ipv6/conf/eip1/disable_ipv6 || fail "disable_ipv6 eip1"
+
+/etherip6ctl set eip0 up || fail "up eip0"
+/etherip6ctl set eip1 up || fail "up eip1"
+/etherip6ctl show || fail "show all"
+/etherip6ctl show eip0 || fail "show eip0"
+/etherip6ctl show eip0 | grep -q "remote.*2001:db8::2" ||
+	fail "show remote address"
+echo "NL CONFIG OK"
+
+/sbin/ip -d link show eip0 || true
+/sbin/ip -s link show eip0 || true
+
+echo "--- fragmented outer path (lo MTU 1280) ---"
+/etherip6_selftest eip0 eip1 --expect-frag || fail "selftest eip0->eip1 (frag)"
+/etherip6_selftest eip1 eip0 --expect-frag || fail "selftest eip1->eip0 (frag)"
+
+echo "--- jumbo outer path (lo MTU 65536) ---"
+/etherip6ctl del eip0 || fail "del eip0"
+/etherip6ctl del eip1 || fail "del eip1"
+/sbin/ip link set lo mtu 65536 || fail "lo mtu 65536"
+/etherip6ctl create eip0 local 2001:db8::1 remote 2001:db8::2 mtu 9000 ||
+	fail "recreate eip0"
+/etherip6ctl create eip1 local 2001:db8::2 remote 2001:db8::1 mtu 9000 ||
+	fail "recreate eip1"
+echo 1 > /proc/sys/net/ipv6/conf/eip0/disable_ipv6 || fail "disable_ipv6 eip0 (2)"
+echo 1 > /proc/sys/net/ipv6/conf/eip1/disable_ipv6 || fail "disable_ipv6 eip1 (2)"
+/etherip6ctl set eip0 up || fail "up eip0 (2)"
+/etherip6ctl set eip1 up || fail "up eip1 (2)"
+/etherip6_selftest eip0 eip1 --no-frag || fail "selftest jumbo path"
+echo "JUMBO OK"
+
+echo "--- outer MTU cap without ICMPv6 PTB ---"
+/etherip6ctl del eip0 || fail "del eip0 (cap)"
+/etherip6ctl del eip1 || fail "del eip1 (cap)"
+/sbin/ip link set lo mtu 65536 || fail "lo mtu 65536 (cap)"
+/etherip6ctl create eip0 local 2001:db8::1 remote 2001:db8::2 mtu 9000 outer-mtu 1400 ||
+	fail "create eip0 (cap)"
+/etherip6ctl create eip1 local 2001:db8::2 remote 2001:db8::1 mtu 9000 outer-mtu 1400 ||
+	fail "create eip1 (cap)"
+echo 1 > /proc/sys/net/ipv6/conf/eip0/disable_ipv6 || fail "disable_ipv6 eip0 (cap)"
+echo 1 > /proc/sys/net/ipv6/conf/eip1/disable_ipv6 || fail "disable_ipv6 eip1 (cap)"
+/etherip6ctl set eip0 up || fail "up eip0 (cap)"
+/etherip6ctl set eip1 up || fail "up eip1 (cap)"
+/etherip6ctl show eip0 | grep -q "mtu 1400" || fail "show outer-mtu"
+/etherip6_selftest eip0 eip1 --expect-frag || fail "selftest outer-mtu cap"
+/etherip6ctl set eip0 outer-mtu 0 || fail "clear outer-mtu eip0"
+/etherip6ctl set eip1 outer-mtu 0 || fail "clear outer-mtu eip1"
+/etherip6_selftest eip0 eip1 --no-frag || fail "selftest after clearing outer-mtu"
+echo "OUTER-MTU OK"
+
+echo "--- live reconfiguration ---"
+/etherip6ctl set eip0 tclass 46 flowlabel 0x12345 hoplimit 32 ||
+	fail "set outer header fields"
+/etherip6ctl show eip0 | grep -q "tclass 46" || fail "show tclass"
+/etherip6ctl show eip0 | grep -q "flowlabel 0x12345" || fail "show flowlabel"
+/etherip6_selftest eip0 eip1 --no-frag || fail "selftest after reconfig"
+/etherip6ctl set eip0 mtu 4000 || fail "set mtu 4000"
+/sbin/ip link show eip0 | grep -q "mtu 4000" || fail "mtu 4000 not applied"
+/etherip6ctl set eip0 mtu 9000 || fail "set mtu 9000"
+echo "RECONFIG OK"
+
+echo "--- iproute2 interoperability ---"
+if /sbin/ip link add eip2 type etherip6 2>/dev/null; then
+	echo "IPROUTE2_CREATE_OK"
+	/sbin/ip link del eip2 || true
+else
+	echo "IPROUTE2_CREATE_UNSUPPORTED (use etherip6ctl)"
+fi
+
+echo "--- validation of rejected configurations ---"
+if /etherip6ctl create eipbad local 2001:db8::1 2>/dev/null; then
+	fail "half configured device (local only) was accepted"
+fi
+if /etherip6ctl create eipbad remote 2001:db8::2 2>/dev/null; then
+	fail "half configured device (remote only) was accepted"
+fi
+if /etherip6ctl set eip0 outer-mtu 100 2>/dev/null; then
+	fail "invalid outer-mtu was accepted"
+fi
+if /etherip6ctl set eip0 flowlabel 0x100000 2>/dev/null; then
+	fail "invalid flowlabel was accepted"
+fi
+if /etherip6ctl set eip0 link eip0 2>/dev/null; then
+	fail "tunnel device accepted as its own link"
+fi
+echo "VALIDATION OK"
+
+
+echo "--- netns + iperf3 throughput ---"
+
+measure_iperf() {
+	mi_ns=$1
+	mi_dst=$2
+	mi_port=$3
+	shift 3
+	/sbin/ip netns exec ns2 /usr/bin/iperf3 -s -1 -p "$mi_port" \
+		>/tmp/iperf3-s-$mi_port.log 2>&1 &
+	sleep 2
+	mi_out=$(timeout 30 /sbin/ip netns exec "$mi_ns" /usr/bin/iperf3 \
+		-c "$mi_dst" -p "$mi_port" -t 5 -f m "$@" 2>&1)
+	echo "$mi_out" > /tmp/iperf3-c-$mi_port.log
+	mi_line=$(printf '%s\n' "$mi_out" | grep 'sender' | head -1)
+	if [ -z "$mi_line" ]; then
+		echo "IPERF FAIL ns=$mi_ns dst=$mi_dst port=$mi_port"
+		printf '%s\n' "$mi_out"
+		return 1
+	fi
+	mi_rate=$(printf '%s\n' "$mi_line" | awk '{print $7}')
+	mi_retr=$(printf '%s\n' "$mi_line" | awk '{print $9}')
+	printf '%s %s\n' "$mi_rate" "$mi_retr"
+}
+
+setup_tunnel() {
+	st_veth_mtu=$1
+	st_eip_mtu=$2
+	/sbin/ip netns exec ns1 /etherip6ctl del eip0 >/dev/null 2>&1
+	/sbin/ip netns exec ns2 /etherip6ctl del eip1 >/dev/null 2>&1
+	/sbin/ip -n ns1 link set v1 mtu "$st_veth_mtu" || return 1
+	/sbin/ip -n ns2 link set v2 mtu "$st_veth_mtu" || return 1
+	/sbin/ip netns exec ns1 /etherip6ctl create eip0 \
+		local 2001:db8:1::1 remote 2001:db8:1::2 link v1 \
+		mtu "$st_eip_mtu" || return 1
+	/sbin/ip netns exec ns2 /etherip6ctl create eip1 \
+		local 2001:db8:1::2 remote 2001:db8:1::1 link v2 \
+		mtu "$st_eip_mtu" || return 1
+	/sbin/ip netns exec ns1 sh -c \
+		'echo 1 > /proc/sys/net/ipv6/conf/eip0/disable_ipv6' || return 1
+	/sbin/ip netns exec ns2 sh -c \
+		'echo 1 > /proc/sys/net/ipv6/conf/eip1/disable_ipv6' || return 1
+	/sbin/ip -n ns1 addr add 10.0.0.1/24 dev eip0 || return 1
+	/sbin/ip -n ns2 addr add 10.0.0.2/24 dev eip1 || return 1
+	/sbin/ip netns exec ns1 /etherip6ctl set eip0 up || return 1
+	/sbin/ip netns exec ns2 /etherip6ctl set eip1 up || return 1
+	return 0
+}
+
+
+snmp6_get() {
+	/sbin/ip netns exec "$1" /bin/awk -v k="$2" \
+		'$1 == k { print $2; exit }' /proc/net/snmp6
+}
+
+snmp6_sum() {
+	ss_a=$(snmp6_get ns1 "$1")
+	ss_b=$(snmp6_get ns2 "$1")
+	[ -n "$ss_a" ] || ss_a=0
+	[ -n "$ss_b" ] || ss_b=0
+	echo $((ss_a + ss_b))
+}
+
+frag_iperf() {
+	fi_label=$1
+	fi_dst=$2
+	fi_port=$3
+	shift 3
+	fi_c0=$(snmp6_sum Ip6FragCreates)
+	fi_f0=$(snmp6_sum Ip6FragFails)
+	fi_r0=$(snmp6_sum Ip6ReasmOKs)
+	fi_e0=$(snmp6_sum Ip6ReasmFails)
+	/sbin/ip netns exec ns2 /usr/bin/iperf3 -s -1 -p "$fi_port" \
+		>/tmp/frag-s-$fi_port.log 2>&1 &
+	sleep 2
+	fi_out=$(timeout 60 /sbin/ip netns exec ns1 /usr/bin/iperf3 \
+		-c "$fi_dst" -p "$fi_port" -t 5 -f m "$@" 2>&1)
+	fi_rc=$?
+	echo "$fi_out" > /tmp/frag-c-$fi_port.log
+	fi_c1=$(snmp6_sum Ip6FragCreates)
+	fi_f1=$(snmp6_sum Ip6FragFails)
+	fi_r1=$(snmp6_sum Ip6ReasmOKs)
+	fi_e1=$(snmp6_sum Ip6ReasmFails)
+	fi_dc=$((fi_c1 - fi_c0))
+	fi_df=$((fi_f1 - fi_f0))
+	fi_dr=$((fi_r1 - fi_r0))
+	fi_de=$((fi_e1 - fi_e0))
+	echo "FRAG $fi_label creates=$fi_dc fragfails=$fi_df reasm=$fi_dr reasmfails=$fi_de rc=$fi_rc"
+	if [ "$fi_rc" -ne 0 ] ||
+	   ! printf '%s\n' "$fi_out" | grep -q 'sender'; then
+		printf '%s\n' "$fi_out"
+		return 1
+	fi
+	[ "$fi_dc" -gt 0 ] || {
+		echo "FRAG $fi_label: no outer fragments created"
+		return 1
+	}
+	[ "$fi_dr" -gt 0 ] || {
+		echo "FRAG $fi_label: no reassembly observed"
+		return 1
+	}
+	[ "$fi_df" -eq 0 ] || {
+		echo "FRAG $fi_label: $fi_df fragmentation failures"
+		return 1
+	}
+	[ "$fi_de" -eq 0 ] || {
+		echo "FRAG $fi_label: $fi_de reassembly failures"
+		return 1
+	}
+	printf '%s\n' "$fi_out" | grep -E 'sender|receiver' | tail -4
+	return 0
+}
+
+ping_inner() {
+	timeout 10 /sbin/ip netns exec ns1 ping -c 2 10.0.0.2
+}
+
+echo "--- iperf3 smoke test (root ns) ---"
+/sbin/ip link set lo up || fail "lo up (smoke)"
+/usr/bin/iperf3 -v || fail "iperf3 -v"
+/usr/bin/iperf3 -s -1 -p 5299 >/tmp/smoke-s.log 2>&1 &
+sleep 2
+/usr/bin/iperf3 -c 127.0.0.1 -p 5299 -t 1 -f m >/tmp/smoke-c.log 2>&1
+echo "SMOKE rc=$?"
+cat /tmp/smoke-c.log
+cat /tmp/smoke-s.log
+grep -q "sender" /tmp/smoke-c.log || fail "iperf3 smoke test"
+
+insmod /veth.ko || fail "insmod veth.ko"
+mkdir -p /run/netns
+/sbin/ip netns add ns1 || fail "ip netns add ns1"
+/sbin/ip netns add ns2 || fail "ip netns add ns2"
+/sbin/ip link add v1 type veth peer name v2 || fail "veth pair"
+/sbin/ip link set v1 netns ns1 || fail "v1 -> ns1"
+/sbin/ip link set v2 netns ns2 || fail "v2 -> ns2"
+/sbin/ip -n ns1 link set lo up
+/sbin/ip -n ns2 link set lo up
+/sbin/ip -n ns1 link set v1 mtu 9000 up || fail "v1 up"
+/sbin/ip -n ns2 link set v2 mtu 9000 up || fail "v2 up"
+/sbin/ip -n ns1 -6 addr add 2001:db8:ff::1/64 dev v1 || fail "v1 outer addr"
+/sbin/ip -n ns2 -6 addr add 2001:db8:ff::2/64 dev v2 || fail "v2 outer addr"
+/sbin/ip -n ns1 -6 addr add 2001:db8:1::1/128 dev lo || fail "ns1 endpoint"
+/sbin/ip -n ns2 -6 addr add 2001:db8:1::2/128 dev lo || fail "ns2 endpoint"
+/sbin/ip -n ns1 -6 route add 2001:db8:1::2/128 \
+	via 2001:db8:ff::2 dev v1 || fail "ns1 outer route"
+/sbin/ip -n ns2 -6 route add 2001:db8:1::1/128 \
+	via 2001:db8:ff::1 dev v2 || fail "ns2 outer route"
+/sbin/ip -n ns1 addr add 192.0.2.1/24 dev v1 || fail "v1 baseline addr"
+/sbin/ip -n ns2 addr add 192.0.2.2/24 dev v2 || fail "v2 baseline addr"
+
+echo "--- baseline: raw veth with GSO/TSO on, MSS 1400 ---"
+res=$(measure_iperf ns1 192.0.2.2 5201 -M 1400) || fail "baseline iperf3 (gso on)"
+set -- $res
+B0G=$1
+B0GR=$2
+echo "IPERF baseline_veth_gso rate=$B0G Mbits/sec retr=$B0GR"
+
+echo "--- baseline: raw veth with GSO/TSO/GRO off, MSS 1400 ---"
+/sbin/ip netns exec ns1 /usr/sbin/ethtool -K v1 gso off tso off gro off ||
+	fail "ethtool v1 offloads off"
+/sbin/ip netns exec ns2 /usr/sbin/ethtool -K v2 gso off tso off gro off ||
+	fail "ethtool v2 offloads off"
+res=$(measure_iperf ns1 192.0.2.2 5202 -M 1400) || fail "baseline iperf3 (gso off)"
+set -- $res
+B0=$1
+B0R=$2
+echo "IPERF baseline_veth_no_gso rate=$B0 Mbits/sec retr=$B0R"
+
+echo "--- tunnel: eip MTU 1500, veth MTU 9000 (no outer frag) ---"
+setup_tunnel 9000 1500 || fail "setup tunnel 1500/9000"
+echo "--- fresh device stats check ---"
+/sbin/ip netns exec ns1 /etherip6ctl create eipz \
+	local 2001:db8:9::1 remote 2001:db8:9::2 mtu 1500 ||
+	fail "create eipz"
+/sbin/ip netns exec ns1 /etherip6ctl show eipz | grep -E "rx|tx"
+/sbin/ip netns exec ns1 /etherip6ctl show eipz | grep -q "rx       0 packets" ||
+	fail "fresh device statistics are not zero"
+/sbin/ip netns exec ns1 /etherip6ctl del eipz || fail "del eipz"
+ping_inner || fail "inner ping"
+res=$(measure_iperf ns1 10.0.0.2 5203 -M 1400) || fail "tunnel iperf3 fwd"
+set -- $res
+T1=$1
+T1R=$2
+echo "IPERF tunnel_nofrag rate=$T1 Mbits/sec retr=$T1R"
+res=$(measure_iperf ns1 10.0.0.2 5204 -M 1400 -R) || fail "tunnel iperf3 rev"
+set -- $res
+T1REV=$1
+T1REVR=$2
+echo "IPERF tunnel_nofrag_reverse rate=$T1REV Mbits/sec retr=$T1REVR"
+
+echo "--- jumbo baseline: raw veth, MSS 8960 ---"
+/sbin/ip -n ns1 link set v1 mtu 9200 || fail "v1 mtu 9200"
+/sbin/ip -n ns2 link set v2 mtu 9200 || fail "v2 mtu 9200"
+res=$(measure_iperf ns1 192.0.2.2 5205 -M 8960) || fail "jumbo baseline"
+set -- $res
+B2=$1
+B2R=$2
+echo "IPERF baseline_veth_jumbo rate=$B2 Mbits/sec retr=$B2R"
+
+echo "--- tunnel: eip MTU 9000, veth MTU 9200 (no outer frag) ---"
+setup_tunnel 9200 9000 || fail "setup jumbo tunnel"
+ping_inner || fail "inner ping jumbo"
+res=$(measure_iperf ns1 10.0.0.2 5206 -M 8960) || fail "jumbo tunnel"
+set -- $res
+T2=$1
+T2R=$2
+echo "IPERF tunnel_jumbo rate=$T2 Mbits/sec retr=$T2R"
+
+echo "--- tunnel: eip MTU 9000, veth MTU 1500 (outer frag) ---"
+setup_tunnel 1500 9000 || fail "setup frag tunnel"
+ping_inner || fail "inner ping frag"
+res=$(measure_iperf ns1 10.0.0.2 5207 -M 8960) || fail "frag tunnel"
+set -- $res
+T3=$1
+T3R=$2
+echo "IPERF tunnel_frag rate=$T3 Mbits/sec retr=$T3R"
+
+R1G=$(awk -v a="$T1" -v b="$B0G" 'BEGIN { printf "%.1f", (b > 0 ? 100*a/b : 0) }')
+R1=$(awk -v a="$T1" -v b="$B0" 'BEGIN { printf "%.1f", (b > 0 ? 100*a/b : 0) }')
+R2=$(awk -v a="$T2" -v b="$B2" 'BEGIN { printf "%.1f", (b > 0 ? 100*a/b : 0) }')
+R3=$(awk -v a="$T3" -v b="$T2" 'BEGIN { printf "%.1f", (b > 0 ? 100*a/b : 0) }')
+echo "RATIO tunnel_nofrag/baseline_gso=${R1G}% tunnel_nofrag/baseline_no_gso=${R1}% tunnel_jumbo/baseline=${R2}% tunnel_frag/nofrag=${R3}%"
+echo "NETNS_SUMMARY baseline_gso=${B0G} baseline_no_gso=${B0} tunnel_nofrag=${T1} tunnel_nofrag_rev=${T1REV} baseline_jumbo=${B2} tunnel_jumbo=${T2} tunnel_frag=${T3}"
+
+awk -v r="$R1" 'BEGIN { exit !(r >= 50) }' ||
+	fail "tunnel throughput below 50% of the fair baseline (${R1}%)"
+
+echo "--- fragmentation matrix (TCP) ---"
+
+setup_tunnel 1500 9000 || fail "frag matrix: setup 1500"
+ping_inner || fail "frag matrix: ping 1500"
+frag_iperf frag1500_forward 10.0.0.2 5301 -M 8960 ||
+	fail "frag matrix: forward 1500"
+frag_iperf frag1500_reverse 10.0.0.2 5302 -M 8960 -R ||
+	fail "frag matrix: reverse 1500"
+
+setup_tunnel 1400 9000 || fail "frag matrix: setup 1400"
+ping_inner || fail "frag matrix: ping 1400"
+frag_iperf frag1400_bidir 10.0.0.2 5303 -M 8960 --bidir -P 2 ||
+	fail "frag matrix: bidir 1400"
+
+setup_tunnel 1280 9000 || fail "frag matrix: setup 1280"
+ping_inner || fail "frag matrix: ping 1280"
+frag_iperf frag1280_p4 10.0.0.2 5304 -M 8960 -P 4 ||
+	fail "frag matrix: parallel 1280"
+
+setup_tunnel 9200 9000 || fail "frag matrix: setup outer-mtu"
+/sbin/ip netns exec ns1 /etherip6ctl set eip0 outer-mtu 1400 ||
+	fail "frag matrix: outer-mtu eip0"
+/sbin/ip netns exec ns2 /etherip6ctl set eip1 outer-mtu 1400 ||
+	fail "frag matrix: outer-mtu eip1"
+ping_inner || fail "frag matrix: ping outer-mtu"
+frag_iperf outermtu1400_forward 10.0.0.2 5305 -M 8960 ||
+	fail "frag matrix: outer-mtu forward"
+/sbin/ip netns exec ns1 /etherip6ctl set eip0 outer-mtu 0 ||
+	fail "frag matrix: clear outer-mtu eip0"
+/sbin/ip netns exec ns2 /etherip6ctl set eip1 outer-mtu 0 ||
+	fail "frag matrix: clear outer-mtu eip1"
+
+echo "FRAG_TCP_OK"
+
+awk -v r="$R2" 'BEGIN { exit !(r >= 50) }' ||
+	fail "jumbo tunnel throughput below 50% of baseline (${R2}%)"
+	killall iperf3 >/dev/null 2>&1 || true
+/sbin/ip netns exec ns1 /etherip6ctl show eip0 || true
+/sbin/ip -n ns1 -s link show eip0 || true
+echo "NETNS_IPERF_OK"
+
+echo "--- cleanup / kernel log check ---"
+/etherip6ctl del eip0 || fail "final del eip0"
+/etherip6ctl del eip1 || fail "final del eip1"
+
+if dmesg | grep -E "BUG:|WARNING:|Oops|general protection|Call Trace"; then
+	fail "kernel log contains warnings"
+fi
+
+echo "INIT OK"
+poweroff -f
+sleep 5
+exit 0

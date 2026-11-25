@@ -1,0 +1,16 @@
+# build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+src/Module.symvers
+src/modules.order
+src/.*.cmd
+tools/etherip6ctl
+tests/etherip6_selftest
+tests/*.static
+# test VM scratch area
+.vmtest/
